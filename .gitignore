@@ -1,0 +1,47 @@
+# Credentials and local configuration
+p.txt
+pat.txt
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+credentials*.json
+secrets*.json
+
+# Private runtime state, browser profiles, captures, and exports
+.runtime/
+.edgemcp-edge-profile/
+profiles/
+downloads/
+*.log
+*.err
+*.pid
+*.csv
+*.zip
+*.tar
+*.gz
+smoke.png
+
+# Python environments, caches, and build outputs
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+node_modules/
