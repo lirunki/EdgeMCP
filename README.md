@@ -10,9 +10,12 @@ agent can reach, and drives the **current page** in Microsoft Edge over the
 > a dedicated debugging profile rather than the normal browser profile.
 > See FEASIBILITY.md for extension-based alternatives.
 
-**Security:** this proof of concept has no built-in authentication or TLS.
-It binds to localhost by default. Read [SECURITY.md](SECURITY.md) before enabling
-remote access, and do not use a sensitive browser profile.
+**Security:** the MCP endpoint has no built-in authentication or TLS. It binds
+to localhost by default. The optional forwarding-only SSH server requires either
+public-key or configured username/password authentication, but does not
+authenticate MCP clients. Read
+[SECURITY.md](SECURITY.md) before enabling remote access, and do not use a
+sensitive browser profile.
 
 ## How it works
 
@@ -26,6 +29,105 @@ Claude Desktop, the `mcp` CLI, a remote agent — can reach it over the network)
 It forwards each tool call to Edge via CDP. All page-control capability
 (navigate, eval, click, type, screenshot, …) runs against the tab Edge exposes
 for debugging.
+
+## Forward CDP from another machine with mini-SSHD
+
+EdgeMCP can run an in-process, forwarding-only SSH server. This allows **Machine
+A** to keep Edge CDP on its own loopback while forwarding it to **thisMachine**,
+where EdgeMCP and the remotely reachable MCP endpoint run:
+
+```text
+remote agent ──MCP──► thisMachine:8080 ──► 127.0.0.1:9333
+                                             │ SSH -R
+                                             ▼
+                                      Machine A:127.0.0.1:9222 ──► Edge
+```
+
+1. Choose an SSH authentication method. You can add Machine A's SSH public key
+   to `~/.ssh/authorized_keys` on thisMachine (or select another file with
+   `--sshd-authorized-keys`). Alternatively, create a protected password file
+   containing exactly one non-empty UTF-8 line:
+
+   ```bash
+   mkdir -m 700 -p ~/.edgemcp
+   install -m 600 /dev/null ~/.edgemcp/forwarding-password
+   printf '%s\n' 'replace-with-a-strong-password' > ~/.edgemcp/forwarding-password
+   ```
+
+   Then start EdgeMCP on thisMachine. Here `9333` is the tunnel listener and
+   `2222` is mini-SSHD. For password authentication, add the final two flags:
+
+   ```bash
+   python src/server.py \
+     --sshd 2222 \
+     --cdp 127.0.0.1:9333 \
+     --listen 0.0.0.0:8080 \
+     --sshd-user forwarder \
+     --sshd-password-file ~/.edgemcp/forwarding-password
+   ```
+
+2. Start Edge on Machine A with CDP on its loopback port, for example `9222`.
+   From Machine A, establish the reverse forward using OpenSSH's `-p` syntax:
+
+   ```bash
+   ssh -N -p 2222 \
+     -o ExitOnForwardFailure=yes \
+     -R 127.0.0.1:9333:127.0.0.1:9222 \
+     user@thisMachine
+   ```
+
+   `-N` is recommended because no remote shell is needed. A command without
+   `-N` is also kept connected by an inert forwarding-only session, but there
+   is no command interpreter. Remote exec, subsystems, direct forwarding,
+   agent forwarding, and X11 forwarding are rejected. Only a loopback remote
+   listener on the exact configured CDP port (`9333` here) is accepted.
+
+3. Point agents at `http://thisMachine:8080/mcp`.
+
+At least one authentication source is mandatory: an existing authorized-keys
+file or `--sshd-user` plus `--sshd-password-file`. When both are configured,
+either method is accepted. The password file is read once at startup; one final
+LF or CRLF is removed, while other spaces are preserved. It must not contain
+additional lines. Protect it from other users and restart EdgeMCP after rotating
+it. Password-authentication usernames are checked exactly but are not mapped to
+OS accounts. Public keys continue to accept any supplied SSH username against
+the shared authorized-keys file.
+
+The default server host key is `~/.edgemcp/ssh_host_ed25519_key`; it is generated
+once with private permissions and reused. Use `--sshd-host-key PATH` to supply a
+different unencrypted host private key. Verify and retain the host fingerprint
+as you would for any SSH server.
+
+`--sshd PORT` binds SSH on `0.0.0.0` by default so Machine A can reach it. Use
+`--sshd HOST:PORT` or `SSHD_HOST` to narrow that listener. `--sshd` requires a
+loopback `--cdp` address and cannot be combined with `--launch-edge`. The MCP
+listener remains independently unauthenticated: expose `--listen 0.0.0.0:8080`
+only on a trusted/restricted network or behind an authenticated gateway.
+
+### Diagnosing identification/banner timeouts
+
+The mini-SSHD logs every accepted TCP connection as `[edgemcp:sshd] TCP
+connection from ...` and logs closure/handshake errors. If OpenSSH reports
+`kex_exchange_identification` or `banner exchange ... timed out`:
+
+- First try the standard SSH port, `--sshd 22`, especially from hardened or
+  privileged-access workstations. Such networks commonly permit SSH on port 22
+  to approved destinations while silently dropping application data on ports
+  such as 2222. On Unix, binding port 22 may require elevated bind capability;
+  do not run all of EdgeMCP as root merely to obtain the port.
+- No corresponding EdgeMCP TCP log means the handshake was accepted or
+  intercepted before reaching this process (for example by NAT, a VPN relay,
+  endpoint security, or a firewall). `Test-NetConnection` can still report true
+  when an intermediary completed the TCP handshake.
+- A TCP log with no `Remote protocol version` on `ssh -vvv` means EdgeMCP
+  accepted the socket and emitted its `SSH-2.0-...` identification, but the
+  return traffic was dropped or intercepted. Check both directions of the
+  route and any SSH/DPI policy.
+- Authentication and KEX algorithm problems occur only after `ssh -vvv` prints
+  the remote protocol version, and produce different diagnostics.
+
+The integration suite directly verifies that the server identification banner
+is emitted immediately after TCP connection, before client authentication.
 
 ## The endpoint
 
@@ -231,8 +333,15 @@ Flags:
 - `--listen HOST:PORT` — MCP HTTP bind address (default `127.0.0.1:8080`). Non-loopback binding requires external access controls.
 - `--path PATH` — endpoint path (default `/mcp`).
 - `--launch-edge` — launch local Edge on the configured CDP port before serving MCP (off by default).
+- `--sshd [HOST:]PORT` — run the forwarding-only SSH server; a bare port binds using `SSHD_HOST` (default `0.0.0.0`).
+- `--sshd-authorized-keys PATH` — allowed client public keys (default `SSHD_AUTHORIZED_KEYS` or `~/.ssh/authorized_keys`).
+- `--sshd-host-key PATH` — unencrypted server private key, generated as Ed25519 if missing (default `SSHD_HOST_KEY` or `~/.edgemcp/ssh_host_ed25519_key`).
+- `--sshd-user USER` — exact username accepted for password authentication (default `SSHD_USER`).
+- `--sshd-password-file PATH` — one-line UTF-8 password file; requires `--sshd-user` (default `SSHD_PASSWORD_FILE`).
 
-Env vars (`CDP_HOST`, `CDP_PORT`, `MCP_HOST`, `MCP_PORT`, `MCP_PATH`) still work as fallback defaults if a flag is omitted.
+Env vars (`CDP_HOST`, `CDP_PORT`, `MCP_HOST`, `MCP_PORT`, `MCP_PATH`,
+`SSHD_HOST`, `SSHD_AUTHORIZED_KEYS`, `SSHD_HOST_KEY`, `SSHD_USER`,
+`SSHD_PASSWORD_FILE`) work as fallback defaults.
 
 ### 4. Run the smoke test
 
@@ -278,6 +387,11 @@ must perform the MCP initialization handshake.
 | `--listen` | `MCP_HOST`/`MCP_PORT` | `127.0.0.1:8080` | MCP HTTP bind address (localhost-only by default). |
 | `--path` | `MCP_PATH` | `/mcp` | Streamable-HTTP endpoint path. |
 | `--launch-edge` | — | off | Launch local Edge on `--cdp` before starting MCP. |
+| `--sshd [HOST:]PORT` | `SSHD_HOST` (host only) | off (`0.0.0.0` host) | Start forwarding-only mini-SSHD. |
+| `--sshd-authorized-keys PATH` | `SSHD_AUTHORIZED_KEYS` | `~/.ssh/authorized_keys` | Authorized client public keys. |
+| `--sshd-host-key PATH` | `SSHD_HOST_KEY` | `~/.edgemcp/ssh_host_ed25519_key` | Persistent server host key. |
+| `--sshd-user USER` | `SSHD_USER` | unset | Username for password authentication. |
+| `--sshd-password-file PATH` | `SSHD_PASSWORD_FILE` | unset | Protected one-line password file; requires a user. |
 
 ## WSL note
 
@@ -301,14 +415,16 @@ must not be committed or included in shared archives. See [SECURITY.md](SECURITY
 ```
 FEASIBILITY.md          # feasibility analysis & the 3 architecture shapes
 SECURITY.md             # trust boundary and safe deployment guidance
-requirements.txt        # mcp (v2), pychrome
+requirements.txt        # mcp (v2), pychrome, AsyncSSH
 src/server.py           # the MCP server (Streamable HTTP) + CDP tool handlers
 src/edge_launcher.py    # shared configured-port browser launcher
+src/mini_sshd.py         # authenticated, forwarding-only in-process SSH server
 scripts/launch-edge.sh  # WSL launcher for Edge
 scripts/launch-edge.ps1 # Windows launcher for Edge
 scripts/smoke_http.py   # asserted HTTP integration test with local fixture
 tests/test_waiting_navigation.py # wait/navigation unit tests
 tests/test_edge_launcher.py     # launch helper and CLI/tool unit tests (mocked processes)
+tests/test_mini_sshd.py          # policy, CLI, authentication and real forwarding tests
 ```
 
 ## Why not an extension?

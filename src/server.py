@@ -8,12 +8,16 @@ Protocol, and exposes browser-control tools (navigate, eval, click, screenshotâ€
 
 Usage:
   python src/server.py --cdp 127.0.0.1:9222 --listen 127.0.0.1:8080 [--launch-edge] [--path /mcp]
+  python src/server.py --sshd 2222 --cdp 127.0.0.1:9333 --listen 0.0.0.0:8080
 
 Flags (env fallbacks shown):
   --cdp HOST:PORT     Edge remote-debugging address    (CDP_HOST/CDP_PORT, 127.0.0.1:9222)
   --listen HOST:PORT  MCP HTTP bind address             (MCP_HOST/MCP_PORT, 127.0.0.1:8080)
   --path PATH         MCP Streamable-HTTP endpoint path (MCP_PATH, /mcp)
   --launch-edge       launch local Edge on the configured CDP port before serving
+  --sshd [HOST:]PORT  accept an SSH remote forward for the configured loopback CDP port
+  --sshd-user USER     username for optional password authentication
+  --sshd-password-file PATH  read the SSH password from a protected one-line file
 
 Many tools accept an optional `frame` argument to operate inside an <iframe>:
   frame=None        the main/top-level document (default)
@@ -35,6 +39,7 @@ from typing import Any, Literal
 
 import pychrome
 import edge_launcher
+import mini_sshd
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.types import Image
 
@@ -44,6 +49,15 @@ CDP_PORT = os.environ.get("CDP_PORT", "9222")
 MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8080"))
 MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
+SSHD_HOST = os.environ.get("SSHD_HOST", "0.0.0.0")
+SSHD_AUTHORIZED_KEYS = os.environ.get(
+    "SSHD_AUTHORIZED_KEYS", str(os.path.expanduser("~/.ssh/authorized_keys"))
+)
+SSHD_HOST_KEY = os.environ.get(
+    "SSHD_HOST_KEY", str(os.path.expanduser("~/.edgemcp/ssh_host_ed25519_key"))
+)
+SSHD_USER = os.environ.get("SSHD_USER")
+SSHD_PASSWORD_FILE = os.environ.get("SSHD_PASSWORD_FILE")
 
 mcp = MCPServer("edgemcp")
 
@@ -740,6 +754,35 @@ def main() -> None:
         action="store_true",
         help="Launch local Edge with CDP on the configured --cdp port before starting MCP",
     )
+    parser.add_argument(
+        "--sshd",
+        metavar="[HOST:]PORT",
+        help="Start an in-process SSH server for a remote CDP forward (default bind host: SSHD_HOST or 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--sshd-authorized-keys",
+        default=SSHD_AUTHORIZED_KEYS,
+        metavar="PATH",
+        help="OpenSSH public keys allowed to connect (default: SSHD_AUTHORIZED_KEYS or ~/.ssh/authorized_keys)",
+    )
+    parser.add_argument(
+        "--sshd-host-key",
+        default=SSHD_HOST_KEY,
+        metavar="PATH",
+        help="SSH host private key; an Ed25519 key is created if absent (default: SSHD_HOST_KEY or ~/.edgemcp/ssh_host_ed25519_key)",
+    )
+    parser.add_argument(
+        "--sshd-user",
+        default=SSHD_USER,
+        metavar="USER",
+        help="SSH username for password authentication (default: SSHD_USER)",
+    )
+    parser.add_argument(
+        "--sshd-password-file",
+        default=SSHD_PASSWORD_FILE,
+        metavar="PATH",
+        help="UTF-8 file containing the SSH password (default: SSHD_PASSWORD_FILE)",
+    )
     args = parser.parse_args()
 
     CDP_HOST, CDP_PORT = _parse_addr(args.cdp, CDP_HOST, CDP_PORT)
@@ -748,6 +791,8 @@ def main() -> None:
     MCP_PATH = args.path
 
     if args.launch_edge:
+        if args.sshd:
+            parser.error("--launch-edge and --sshd are mutually exclusive")
         if str(CDP_PORT).isdecimal() and int(CDP_PORT) == MCP_PORT:
             parser.error("CDP and MCP HTTP must use different ports when launching Edge")
         try:
@@ -755,6 +800,32 @@ def main() -> None:
         except (ValueError, RuntimeError) as exc:
             parser.error(str(exc))
         print(f"[edgemcp] Edge ready: {result['cdp_url']} ({result['browser']}).", flush=True)
+
+    ssh_server = None
+    if args.sshd:
+        if args.sshd_password_file and not args.sshd_user:
+            parser.error("--sshd-password-file requires --sshd-user")
+        if CDP_HOST.lower() not in ("127.0.0.1", "localhost", "::1"):
+            parser.error("--sshd requires a loopback --cdp HOST (127.0.0.1, localhost, or ::1)")
+        sshd_host, sshd_port = _parse_addr(args.sshd, SSHD_HOST, "22")
+        try:
+            ssh_server = mini_sshd.MiniSSHD(
+                sshd_host,
+                sshd_port,
+                CDP_PORT,
+                authorized_keys=args.sshd_authorized_keys,
+                host_key=args.sshd_host_key,
+                username=args.sshd_user,
+                password_file=args.sshd_password_file,
+            )
+            ssh_server.start()
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(
+            f"[edgemcp] SSHD listening on {sshd_host}:{sshd_port}; allowing authenticated "
+            f"remote forwarding only on {CDP_HOST}:{CDP_PORT}.",
+            flush=True,
+        )
 
     if MCP_HOST not in ("127.0.0.1", "localhost", "::1"):
         print(
@@ -781,12 +852,16 @@ def main() -> None:
         f"[edgemcp] MCP Streamable HTTP endpoint: http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}",
         flush=True,
     )
-    mcp.run(
-        transport="streamable-http",
-        host=MCP_HOST,
-        port=MCP_PORT,
-        streamable_http_path=MCP_PATH,
-    )
+    try:
+        mcp.run(
+            transport="streamable-http",
+            host=MCP_HOST,
+            port=MCP_PORT,
+            streamable_http_path=MCP_PATH,
+        )
+    finally:
+        if ssh_server is not None:
+            ssh_server.stop()
 
 
 if __name__ == "__main__":

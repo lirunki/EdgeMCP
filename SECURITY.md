@@ -13,6 +13,26 @@ EdgeMCP is a browser-automation proof of concept, not an internet-facing service
   or add a TLS/authentication gateway and restrict network access. Binding to
   `0.0.0.0` does not add authentication.
 - CDP is another privileged endpoint. Keep the browser debugging port private.
+- Optional `--sshd` requires either a key from `--sshd-authorized-keys` or the
+  exact `--sshd-user` and password read from `--sshd-password-file`. It accepts
+  only a loopback remote listener on the exact configured CDP port. It has no command
+  interpreter: remote exec/subsystems, direct TCP forwarding, agent forwarding,
+  and X11 forwarding are rejected. A plain SSH shell request is an inert channel
+  which exists only to keep `ssh -R` connected; prefer `ssh -N`.
+- The mini-SSHD host key is persistent. Protect `SSHD_HOST_KEY` as a private key,
+  verify its fingerprint on Machine A, and investigate unexpected host-key
+  changes. Restrict the SSH listener with firewall rules even though SSH
+  authentication is mandatory. Entries in its authorized-keys file authorize
+  the forward for any supplied SSH username; they do not grant an OS login.
+- Keep the password file readable only by the EdgeMCP service account. It must
+  contain one non-empty UTF-8 line and is read once at startup. Prefer a long,
+  randomly generated password, rotate it by replacing the file and restarting
+  EdgeMCP, and avoid placing the password itself in command arguments, environment
+  variables, logs, shell history, or source control.
+- SSH authentication protects creation of the CDP tunnel, **not the MCP HTTP
+  endpoint**. A non-loopback `--listen` still needs authentication/network
+  controls. An unauthorized MCP client can use browser control while an
+  authorized tunnel is active.
 - `launch_edge()` can start a browser process on the MCP server's machine.
   The server environment controls `EDGE_PATH` and `EDGE_PROFILE_DIR`; do not
   point them at untrusted executables or sensitive profiles. Launching requires

@@ -1,6 +1,7 @@
 # Credentials and local configuration
 p.txt
 pat.txt
+pwd.txt
 .env
 .env.*
 *.pem
