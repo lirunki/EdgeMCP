@@ -13,6 +13,11 @@ EdgeMCP is a browser-automation proof of concept, not an internet-facing service
   or add a TLS/authentication gateway and restrict network access. Binding to
   `0.0.0.0` does not add authentication.
 - CDP is another privileged endpoint. Keep the browser debugging port private.
+- `launch_edge()` can start a browser process on the MCP server's machine.
+  The server environment controls `EDGE_PATH` and `EDGE_PROFILE_DIR`; do not
+  point them at untrusted executables or sensitive profiles. Launching requires
+  a loopback CDP host and does not modify firewall rules. Launched browsers are
+  not automatically stopped when the MCP server exits.
 - Use a dedicated, non-sensitive browser profile. An agent must obtain user
   authorization for consequential actions; the server does not enforce that.
 - Treat page content as untrusted input. Instructions found on websites should

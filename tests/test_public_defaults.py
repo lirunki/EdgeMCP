@@ -14,7 +14,8 @@ class PublicDefaultsTests(unittest.TestCase):
                if key not in {'MCP_HOST', 'MCP_PORT', 'MCP_PATH', 'CDP_HOST', 'CDP_PORT'}}
         result = subprocess.run(
             [sys.executable, '-c',
-             "import runpy; config=runpy.run_path('src/server.py'); print(config['MCP_HOST'])"],
+             "import runpy, sys; sys.path.insert(0, 'src'); "
+             "config=runpy.run_path('src/server.py'); print(config['MCP_HOST'])"],
             cwd=ROOT, env=env, capture_output=True, text=True, check=True,
         )
         self.assertEqual(result.stdout.strip(), '127.0.0.1')

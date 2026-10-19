@@ -7,12 +7,13 @@ client/agent can reach. The server talks to an Edge instance launched with
 Protocol, and exposes browser-control tools (navigate, eval, click, screenshot…).
 
 Usage:
-  python src/server.py --cdp 127.0.0.1:9222 --listen 127.0.0.1:8080 [--path /mcp]
+  python src/server.py --cdp 127.0.0.1:9222 --listen 127.0.0.1:8080 [--launch-edge] [--path /mcp]
 
 Flags (env fallbacks shown):
   --cdp HOST:PORT     Edge remote-debugging address    (CDP_HOST/CDP_PORT, 127.0.0.1:9222)
   --listen HOST:PORT  MCP HTTP bind address             (MCP_HOST/MCP_PORT, 127.0.0.1:8080)
   --path PATH         MCP Streamable-HTTP endpoint path (MCP_PATH, /mcp)
+  --launch-edge       launch local Edge on the configured CDP port before serving
 
 Many tools accept an optional `frame` argument to operate inside an <iframe>:
   frame=None        the main/top-level document (default)
@@ -33,6 +34,7 @@ import urllib.request
 from typing import Any, Literal
 
 import pychrome
+import edge_launcher
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.types import Image
 
@@ -293,6 +295,15 @@ def _js_str(s: str) -> str:
 
 
 # --- Tools -------------------------------------------------------------------
+
+
+@mcp.tool(description="Launch Microsoft Edge on this server's configured --cdp port, with a dedicated "
+    "profile and loopback CDP listener. Reuses an existing Edge CDP endpoint. Only localhost/127.0.0.1 "
+    "CDP hosts are supported for launching; waits up to 15 seconds for readiness. "
+    "EDGE_PATH and EDGE_PROFILE_DIR can be configured in the server environment. "
+    "The browser remains open when the MCP server exits.")
+def launch_edge() -> dict:
+    return edge_launcher.launch(CDP_HOST, CDP_PORT)
 
 
 @mcp.tool(description="List all open page tabs in the Edge instance.")
@@ -724,12 +735,26 @@ def main() -> None:
         default=MCP_PATH,
         help="MCP Streamable-HTTP endpoint path (default: %(default)s)",
     )
+    parser.add_argument(
+        "--launch-edge",
+        action="store_true",
+        help="Launch local Edge with CDP on the configured --cdp port before starting MCP",
+    )
     args = parser.parse_args()
 
     CDP_HOST, CDP_PORT = _parse_addr(args.cdp, CDP_HOST, CDP_PORT)
     MCP_HOST, MCP_PORT_S = _parse_addr(args.listen, MCP_HOST, str(MCP_PORT))
     MCP_PORT = int(MCP_PORT_S)
     MCP_PATH = args.path
+
+    if args.launch_edge:
+        if str(CDP_PORT).isdecimal() and int(CDP_PORT) == MCP_PORT:
+            parser.error("CDP and MCP HTTP must use different ports when launching Edge")
+        try:
+            result = launch_edge()
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(f"[edgemcp] Edge ready: {result['cdp_url']} ({result['browser']}).", flush=True)
 
     if MCP_HOST not in ("127.0.0.1", "localhost", "::1"):
         print(

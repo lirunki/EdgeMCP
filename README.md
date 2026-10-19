@@ -43,6 +43,7 @@ or gateway and restrict access; see [SECURITY.md](SECURITY.md).
 
 | Tool | What it does |
 |---|---|
+| `launch_edge` | Start local Edge with CDP on the server's configured `--cdp` port, or reuse an existing Edge endpoint. |
 | `list_tabs` | List open page tabs. |
 | `select_tab` | Choose the active tab by target id. |
 | `get_active_tab` | id / url / title of the active tab (top-level frame). |
@@ -108,6 +109,42 @@ close_tab(target_id=null)
 This PoC shares one MCP-selected tab across clients. Use one controlling agent
 at a time; simultaneous commands from multiple clients are not isolated.
 
+## Launching Edge from MCP
+
+There are two ways to ask the server to launch Edge:
+
+```bash
+# Launch Edge on CDP port 9333, then serve MCP on a different port.
+python src/server.py --launch-edge --cdp 127.0.0.1:9333 --listen 127.0.0.1:8080
+```
+
+Or start MCP without the flag and invoke the **`launch_edge()`** tool with no
+arguments. It uses the server's current `--cdp` configuration, not its HTTP
+`--listen` port. The flag and tool share the same launch implementation.
+
+- Launching is supported only when the CDP host is `127.0.0.1` or `localhost`.
+  It starts Edge on the **MCP server's machine**, not on a remote CDP host.
+- The helper discovers a native Edge installation on Windows, Linux or macOS.
+  Set `EDGE_PATH` to override executable discovery. For Windows Edge, run the
+  server with Windows Python; launching Windows Edge from WSL Python is not
+  supported by this tool (the separate WSL shell launcher remains available).
+- By default it uses a dedicated profile named `debug-profile-PORT` under the
+  platform's local application-data/state directory in `EdgeMCP`. Different
+  CDP ports therefore use different profiles. `EDGE_PROFILE_DIR` overrides the
+  exact profile directory; only point it at a dedicated non-sensitive profile.
+- CDP is requested on loopback. An existing **Edge** CDP endpoint is reused;
+  an unrelated service or another browser occupying the port is an error.
+- The helper waits up to 15 seconds after launch for CDP readiness. It returns
+  `started`, `already_running`, `cdp_url`, and `browser`; a new launch also
+  returns `launch_pid` (the launcher PID, not necessarily the final browser PID).
+- A launch timeout is an error, not success. The process may still be starting;
+  retries within the same server wait on that pending attempt instead of
+  blindly spawning duplicates. Check browser policy/profile conflicts if it
+  never becomes ready.
+- **The browser remains open when MCP exits.** The helper does not kill browsers
+  or modify firewall rules. Without the CLI flag or a tool invocation, MCP
+  never launches Edge automatically.
+
 ## Operating inside iframes (`frame` parameter)
 
 Most DOM tools accept an optional `frame` argument to operate inside an `<iframe>`:
@@ -145,6 +182,9 @@ python -m venv .venv
 ```
 
 ### 2. Launch Edge with remote debugging
+
+To launch both Edge and the MCP server in one command, use `--launch-edge` as
+shown above (then skip step 3). Alternatively, launch Edge separately:
 
 **From Windows PowerShell:**
 
@@ -190,6 +230,7 @@ Flags:
 - `--cdp HOST:PORT` — Edge remote-debugging address (default `127.0.0.1:9222`).
 - `--listen HOST:PORT` — MCP HTTP bind address (default `127.0.0.1:8080`). Non-loopback binding requires external access controls.
 - `--path PATH` — endpoint path (default `/mcp`).
+- `--launch-edge` — launch local Edge on the configured CDP port before serving MCP (off by default).
 
 Env vars (`CDP_HOST`, `CDP_PORT`, `MCP_HOST`, `MCP_PORT`, `MCP_PATH`) still work as fallback defaults if a flag is omitted.
 
@@ -236,6 +277,7 @@ must perform the MCP initialization handshake.
 | `--cdp` | `CDP_HOST`/`CDP_PORT` | `127.0.0.1:9222` | Edge remote-debugging address. |
 | `--listen` | `MCP_HOST`/`MCP_PORT` | `127.0.0.1:8080` | MCP HTTP bind address (localhost-only by default). |
 | `--path` | `MCP_PATH` | `/mcp` | Streamable-HTTP endpoint path. |
+| `--launch-edge` | — | off | Launch local Edge on `--cdp` before starting MCP. |
 
 ## WSL note
 
@@ -261,10 +303,12 @@ FEASIBILITY.md          # feasibility analysis & the 3 architecture shapes
 SECURITY.md             # trust boundary and safe deployment guidance
 requirements.txt        # mcp (v2), pychrome
 src/server.py           # the MCP server (Streamable HTTP) + CDP tool handlers
+src/edge_launcher.py    # shared configured-port browser launcher
 scripts/launch-edge.sh  # WSL launcher for Edge
 scripts/launch-edge.ps1 # Windows launcher for Edge
 scripts/smoke_http.py   # asserted HTTP integration test with local fixture
-tests/test_waiting_navigation.py # unit tests (no browser required)
+tests/test_waiting_navigation.py # wait/navigation unit tests
+tests/test_edge_launcher.py     # launch helper and CLI/tool unit tests (mocked processes)
 ```
 
 ## Why not an extension?
