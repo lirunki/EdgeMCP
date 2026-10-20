@@ -3,6 +3,9 @@
 The server supports public-key and optional file-backed password authentication.
 Remote TCP listeners and direct TCP destinations must be loopback-only and use
 explicitly allowed ports, preventing use as a general-purpose SSH proxy.
+An explicitly supplied reverse_broker replaces the inert shell with a bootstrap
+and consenting worker protocol; this is disabled by default. Commands are never
+executed by this SSH server itself.
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncssh
+import reverse_ps
 
 _LOOPBACK_HOSTS = {"", "localhost", "127.0.0.1", "::1"}
 
@@ -100,7 +104,9 @@ class _ForwardServer(asyncssh.SSHServer):
         username: str | None = None,
         password: str | None = None,
         backward_ports: Iterable[str | int] = (),
+        reverse_broker: reverse_ps.Broker | None = None,
     ):
+        self._reverse_broker = reverse_broker
         self._allowed_ports = frozenset(_ports(allowed_ports, "Allowed forward port"))
         self._backward_ports = frozenset(
             _port(port, "SSH backward port") for port in backward_ports
@@ -135,7 +141,9 @@ class _ForwardServer(asyncssh.SSHServer):
             and secrets.compare_digest(password, self._password)
         )
 
-    def session_requested(self) -> _ForwardSession:
+    def session_requested(self):
+        if self._reverse_broker is not None:
+            return reverse_ps.Session(self._reverse_broker)
         return _ForwardSession()
 
     def server_requested(self, listen_host: str, listen_port: int) -> bool:
@@ -166,7 +174,9 @@ class MiniSSHD:
         password_file: str | os.PathLike[str] | None = None,
         forward_ports: Iterable[str | int] = (),
         backward_ports: Iterable[str | int] = (),
+        reverse_broker: reverse_ps.Broker | None = None,
     ):
+        self.reverse_broker = reverse_broker
         self.host = host
         self.port = _port(port, "SSHD port")
         self.cdp_port = _port(cdp_port, "CDP forward port")
@@ -204,6 +214,7 @@ class MiniSSHD:
                 self.username,
                 self._password,
                 self.backward_ports,
+                self.reverse_broker,
             ),
             server_host_keys=[str(self.host_key)],
             authorized_client_keys=(

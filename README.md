@@ -84,8 +84,8 @@ remote agent ──MCP──► thisMachine:8080 ──► 127.0.0.1:9333
      user@thisMachine
    ```
 
-   `-N` is recommended because no remote shell is needed. A command without
-   `-N` is also kept connected by an inert forwarding-only session, but there
+   `-N` is recommended because no remote shell is needed. By default, a command
+   without `-N` is also kept connected by an inert forwarding-only session, but there
    is no command interpreter. Remote exec, subsystems, agent forwarding, X11
    forwarding, and unconfigured direct forwarding are rejected. Only loopback
    remote listeners on the configured CDP port and explicit
@@ -142,6 +142,155 @@ connection from ...` and logs closure/handshake errors. If OpenSSH reports
 The integration suite directly verifies that the server identification banner
 is emitted immediately after TCP connection, before client authentication.
 
+## Optional reverse PowerShell commands (`--reversePS`)
+
+This is **disabled by default**. Without `--reversePS`, the SSH shell remains
+inert/forwarding-only and no `run_powershell` MCP tool is exposed. Existing
+forwarding options are unchanged. This feature does **not** execute commands on
+the EdgeMCP server: commands run in a separately started, consenting Windows
+PowerShell client.
+
+### Start EdgeMCP
+
+```bash
+python src/server.py --sshd 2222 --reversePS \
+  --cdp 127.0.0.1:9333 --listen 127.0.0.1:8080 \
+  --sshd-authorized-keys /path/to/authorized_keys
+```
+
+`--reversePS` requires `--sshd`. Protect MCP with an authenticated tunnel/gateway
+and network restrictions before making it remotely reachable. SSH authentication
+alone **does not protect the MCP command tool**. The same configured SSH keys
+can connect/obtain the bootstrap; a connection becomes an execution worker only
+when it explicitly sends the consent handshake. Keys should be limited to
+trusted administrators. An Edge CDP connection is not required to use this tool.
+
+### Obtain and run the client
+
+Use the repository's **`scripts/reverse-powershell.ps1`**, or retrieve the same
+script through an authenticated SSH shell. Verify the SSH server host key first:
+
+```powershell
+ssh -T -n -p 2222 worker@server.example > reverse-powershell.ps1
+```
+
+With `--reversePS`, the server sends the script followed by this exact line:
+
+```text
+# EDGEMCP_REVERSEPS_BOOTSTRAP_END_V1
+```
+
+The `-n` bootstrap connection closes its input and can then exit. Review the
+script rather than blindly executing downloaded code. The marker is a comment,
+so the saved script remains valid PowerShell. In a **separate PowerShell
+window**, run it using an already configured SSH key/agent:
+
+```powershell
+.\reverse-powershell.ps1 -Server server.example -Port 2222 -User worker `
+  -IdentityFile "$HOME\.ssh\id_ed25519" -AcceptCommands
+```
+
+Optional `-KnownHostsFile PATH` selects a verified known-hosts file; otherwise
+OpenSSH uses its normal known-hosts files. The worker uses `BatchMode=yes` and
+`StrictHostKeyChecking=yes`: interactive passwords and host-key approval are
+not handled in the background transport. Password authentication can be used
+for the initial bootstrap SSH, but the worker currently needs a key/agent.
+`-Label 'test workstation'` can help identify a worker. Do not use a sensitive
+machine/session or add `-AcceptCommands` unless you authorize MCP callers to
+control it. Run under the existing language/execution policy; do not bypass it.
+
+The worker starts **one fresh, persistent `ssh.exe` connection** and skips all
+received bootstrap text up to the marker. It never evaluates that prefix. A
+separate, fixed PowerShell producer and Windows' built-in `cmd.exe` create a
+native OS pipe into SSH; SSH stdout goes to a private local mailbox file. The
+original PowerShell process reads commands and sends JSON results back through
+the producer. This avoids the buffering of a cyclic PS5.1 native-command
+pipeline. `cmd.exe` is used only for pipe/redirection wiring, not for executing
+received commands. No `Add-Type`, .NET stream helper, encoded command, elevation,
+or language-mode change is used. No SSH debug-message transport is used.
+
+### Invoke the MCP tool
+
+First list connected workers:
+
+```json
+{"name":"run_powershell","arguments":{}}
+```
+
+Then use an explicit returned `client_id`:
+
+```json
+{
+  "name": "run_powershell",
+  "arguments": {
+    "client_id": "<returned client_id>",
+    "command": "Get-Date; Get-Location",
+    "timeout": 30000
+  }
+}
+```
+
+Results contain `request_id`, `client_id`, `status`, and (on completion)
+`success`, `output`, `truncated`, `native_exit_code`, and the worker-reported
+`language_mode`.
+
+- One command is in flight per worker; busy workers reject another request.
+  Client IDs are server-assigned and change on reconnection. A display label or
+  reported language mode is metadata, not an authorization/attestation mechanism.
+- Commands are at most **4096 characters**, returned output at most **8192
+  characters**, and wire frames at most **64 KiB**. Unicode is escaped in JSON
+  so Windows PowerShell 5.1's native-pipe encoding does not corrupt results.
+- `timeout` is **1-300000 milliseconds** and limits waiting only. `status:
+  timeout` or `disconnected` means execution may continue/have occurred. Never
+  automatically retry. After timeout, the worker remains busy until a real
+  result or disconnect arrives; a late result clears busy state but is not
+  retained as queryable output/history.
+- Commands execute in a child scope of the **original PowerShell runspace**,
+  retaining its permissions and language mode. This is non-interactive command
+  execution, not a PTY or unrestricted shell. Use self-contained commands;
+  per-command variables are not a persistent terminal environment. Commands
+  requiring prompts, or commands which exit/hang the host, are not supported
+  as interactive workflows. CLM/application controls still apply.
+- Stop the worker with **Ctrl+C**. Local protocol files live under the current
+  user's `%LOCALAPPDATA%\EdgeMCP\reverseps` and are deleted after normal transport
+  shutdown. Keep that directory's inherited ACL private; inspect/remove leftover
+  directories after abnormal termination. The script warns if its transport
+  has not exited. A 4 MiB incoming-file limit bounds session growth; reconnect
+  for a fresh session after reaching it.
+- `-MaxSessionSeconds N` requests shutdown between commands after N seconds
+  (default 0: unlimited). It is not an execution timeout or cancellation feature.
+- `cmd.exe`, a fixed child PowerShell pump, native OpenSSH, and file I/O must be
+  permitted by client policy. Paths/SSH arguments containing cmd metacharacters
+  are rejected. This implementation is tested on Windows PowerShell 5.1 with
+  OpenSSH 9.5, including a locally constrained run; organizational policies may
+  impose additional restrictions. Transport paths and SSH arguments must be
+  printable ASCII (and free of cmd metacharacters); command/output text can be
+  Unicode. Non-ASCII Windows account/profile paths are not yet supported by
+  this batch-file transport.
+
+The tests include actual loopback SSH/native-worker exchanges and verify that
+ConstrainedLanguage still rejects prohibited .NET object construction. Tests
+use generated, temporary keys and do not enable a persistent service.
+
+## Restricted PowerShell client capability check
+
+A diagnostic is available for evaluating a prospective PowerShell/SSH client:
+
+```powershell
+.\scripts\check-powershell-capabilities.ps1
+```
+
+Run it in the actual restricted session, without changing execution policy or
+language mode. It reports version/language mode, command availability, `ssh.exe
+-V`, a known constant script block, a JSON roundtrip, and temporary-file
+read/write/append. It does not connect to a server, load .NET types, execute
+received commands, or leave background processes running. If policy blocks
+it, report that rather than bypassing the restriction.
+
+Command availability is not proof of authorization. This probe does not test a
+full-duplex SSH transport. See the opt-in ReversePS section for the implemented
+native-pipe worker; the mini-SSHD remains forwarding-only by default.
+
 ## The endpoint
 
 The MCP endpoint is the URL a remote agent points its client at:
@@ -158,6 +307,7 @@ or gateway and restrict access; see [SECURITY.md](SECURITY.md).
 
 | Tool | What it does |
 |---|---|
+| `run_powershell` (only with `--reversePS`) | List consenting SSH workers or run a bounded serial command on an explicit client ID. |
 | `launch_edge` | Start local Edge with CDP on the server's configured `--cdp` port, or reuse an existing Edge endpoint. |
 | `list_tabs` | List open page tabs. |
 | `select_tab` | Choose the active tab by target id. |
@@ -346,6 +496,7 @@ Flags:
 - `--listen HOST:PORT` — MCP HTTP bind address (default `127.0.0.1:8080`). Non-loopback binding requires external access controls.
 - `--path PATH` — endpoint path (default `/mcp`).
 - `--launch-edge` — launch local Edge on the configured CDP port before serving MCP (off by default).
+- `--reversePS` — opt in to SSH bootstrap + remote PowerShell workers and expose `run_powershell`; requires `--sshd`, off by default.
 - `--sshd [HOST:]PORT` — run the forwarding-only SSH server; a bare port binds using `SSHD_HOST` (default `0.0.0.0`).
 - `--sshd-forward-port PORT` — allow an additional loopback remote-forward (`-R`) port; repeat for multiple ports (the `--cdp` port is always allowed).
 - `--ssh-backward-port PORT` — allow direct (`-L`) forwarding to this loopback destination port; repeat for multiple ports (disabled by default).
@@ -402,6 +553,7 @@ must perform the MCP initialization handshake.
 | `--listen` | `MCP_HOST`/`MCP_PORT` | `127.0.0.1:8080` | MCP HTTP bind address (localhost-only by default). |
 | `--path` | `MCP_PATH` | `/mcp` | Streamable-HTTP endpoint path. |
 | `--launch-edge` | — | off | Launch local Edge on `--cdp` before starting MCP. |
+| `--reversePS` | — | off | Enable consenting reverse PowerShell workers; requires `--sshd`. |
 | `--sshd [HOST:]PORT` | `SSHD_HOST` (host only) | off (`0.0.0.0` host) | Start forwarding-only mini-SSHD. |
 | `--sshd-forward-port PORT` | — | none | Allow an additional loopback remote-forward (`-R`) port; repeatable. |
 | `--ssh-backward-port PORT` | — | none | Allow direct (`-L`) forwarding to a loopback destination port; repeatable. |
@@ -435,13 +587,17 @@ SECURITY.md             # trust boundary and safe deployment guidance
 requirements.txt        # mcp (v2), pychrome, AsyncSSH
 src/server.py           # the MCP server (Streamable HTTP) + CDP tool handlers
 src/edge_launcher.py    # shared configured-port browser launcher
-src/mini_sshd.py         # authenticated, forwarding-only in-process SSH server
+src/mini_sshd.py        # authenticated SSH forwarding and optional worker sessions
+src/reverse_ps.py       # opt-in serial command broker and bootstrap protocol
+scripts/reverse-powershell.ps1 # consenting Windows client (native pipe transport)
+scripts/check-powershell-capabilities.ps1 # non-network runtime diagnostic
 scripts/launch-edge.sh  # WSL launcher for Edge
 scripts/launch-edge.ps1 # Windows launcher for Edge
 scripts/smoke_http.py   # asserted HTTP integration test with local fixture
 tests/test_waiting_navigation.py # wait/navigation unit tests
 tests/test_edge_launcher.py     # launch helper and CLI/tool unit tests (mocked processes)
 tests/test_mini_sshd.py          # policy, CLI, authentication and real forwarding tests
+tests/test_reverse_ps.py         # opt-in policy, protocol and native CLM worker tests
 ```
 
 ## Why not an extension?

@@ -20,6 +20,7 @@ Flags (env fallbacks shown):
   --ssh-backward-port PORT  allow direct forwarding to a loopback port (repeatable)
   --sshd-user USER     username for optional password authentication
   --sshd-password-file PATH  read the SSH password from a protected one-line file
+  --reversePS         opt-in consenting client command workers and MCP tool (requires --sshd)
 
 Many tools accept an optional `frame` argument to operate inside an <iframe>:
   frame=None        the main/top-level document (default)
@@ -42,6 +43,7 @@ from typing import Any, Literal
 import pychrome
 import edge_launcher
 import mini_sshd
+import reverse_ps
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.types import Image
 
@@ -62,6 +64,24 @@ SSHD_USER = os.environ.get("SSHD_USER")
 SSHD_PASSWORD_FILE = os.environ.get("SSHD_PASSWORD_FILE")
 
 mcp = MCPServer("edgemcp")
+_reverse_broker: reverse_ps.Broker | None = None
+
+
+def run_powershell(command: str | None = None, client_id: str | None = None,
+                   timeout: int = 30000) -> dict:
+    """Opt-in: list consenting SSH workers when called with no arguments.
+
+    Supply command and explicit client_id to execute on THAT CLIENT, not this
+    server. One pending command per worker. Timeout is milliseconds and limits
+    waiting only; timed-out/disconnected execution may continue. Never retry
+    automatically. Output is capped at 8192 characters. Commands remain subject
+    to the client's existing language mode and permissions. Not a PTY terminal.
+    Only exposed when the server is started with --sshd ... --reversePS.
+    """
+    if _reverse_broker is None:
+        raise RuntimeError("ReversePS is disabled; start with --sshd ... --reversePS")
+    return _reverse_broker.run(command, client_id, timeout)
+
 
 # contexts: frameId -> default execution contextId (for Runtime.evaluate in a frame)
 # ctx_to_frame: contextId -> frameId (for cleanup on destroy)
@@ -731,7 +751,7 @@ def _parse_addr(value: str, default_host: str, default_port: str) -> tuple[str, 
 
 
 def main() -> None:
-    global CDP_HOST, CDP_PORT, MCP_HOST, MCP_PORT, MCP_PATH
+    global CDP_HOST, CDP_PORT, MCP_HOST, MCP_PORT, MCP_PATH, _reverse_broker
     parser = argparse.ArgumentParser(
         prog="edgemcp",
         description="MCP server (Streamable HTTP) that drives Edge over CDP.",
@@ -799,7 +819,14 @@ def main() -> None:
         metavar="PATH",
         help="UTF-8 file containing the SSH password (default: SSHD_PASSWORD_FILE)",
     )
+    parser.add_argument(
+        "--reversePS",
+        action="store_true",
+        help="Opt in to a bootstrap SSH shell and MCP run_powershell tool for consenting remote clients; requires --sshd",
+    )
     args = parser.parse_args()
+    if args.reversePS and not args.sshd:
+        parser.error("--reversePS requires --sshd")
 
     CDP_HOST, CDP_PORT = _parse_addr(args.cdp, CDP_HOST, CDP_PORT)
     MCP_HOST, MCP_PORT_S = _parse_addr(args.listen, MCP_HOST, str(MCP_PORT))
@@ -824,6 +851,13 @@ def main() -> None:
         if CDP_HOST.lower() not in ("127.0.0.1", "localhost", "::1"):
             parser.error("--sshd requires a loopback --cdp HOST (127.0.0.1, localhost, or ::1)")
         sshd_host, sshd_port = _parse_addr(args.sshd, SSHD_HOST, "22")
+        reverse_options = {}
+        if args.reversePS:
+            try:
+                _reverse_broker = reverse_ps.Broker()
+            except (OSError, ValueError) as exc:
+                parser.error(f"Cannot load ReversePS bootstrap: {exc}")
+            reverse_options["reverse_broker"] = _reverse_broker
         try:
             ssh_server = mini_sshd.MiniSSHD(
                 sshd_host,
@@ -835,6 +869,7 @@ def main() -> None:
                 password_file=args.sshd_password_file,
                 forward_ports=args.sshd_forward_port,
                 backward_ports=args.ssh_backward_port,
+                **reverse_options,
             )
             ssh_server.start()
         except (ValueError, RuntimeError) as exc:
@@ -853,6 +888,14 @@ def main() -> None:
         print(
             f"[edgemcp] SSHD listening on {sshd_host}:{sshd_port}; allowing authenticated "
             f"remote forwarding only on {allowed_ports}{backward_status}.",
+            flush=True,
+        )
+
+    if args.reversePS:
+        mcp.add_tool(run_powershell)
+        print(
+            "[edgemcp] WARNING: ReversePS enabled. Consenting SSH workers can execute "
+            "PowerShell commands from MCP callers. Restrict MCP access; no HTTP authentication is built in.",
             flush=True,
         )
 
@@ -891,6 +934,9 @@ def main() -> None:
     finally:
         if ssh_server is not None:
             ssh_server.stop()
+        if args.reversePS:
+            mcp.remove_tool("run_powershell")
+            _reverse_broker = None
 
 
 if __name__ == "__main__":

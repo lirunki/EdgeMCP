@@ -24,6 +24,29 @@ EdgeMCP is a browser-automation proof of concept, not an internet-facing service
   interpreter: remote exec/subsystems, agent forwarding, X11 forwarding, and
   unconfigured TCP forwarding are rejected. A plain SSH shell request is an
   inert channel which exists only to keep forwarding connected; prefer `ssh -N`.
+- **`--reversePS` changes the SSH shell behavior and exposes `run_powershell`.**
+  It is off by default and requires `--sshd`. Authenticated shell connections
+  receive a bootstrap PS1 plus a marker. Only a separately started worker which
+  explicitly accepts commands is registered; the bootstrap is never automatically
+  evaluated by the provided worker. SSH exec/subsystem requests remain disabled.
+- ReversePS grants MCP callers arbitrary **client-side** PowerShell execution
+  with that worker's user permissions. Do not expose the unauthenticated MCP
+  endpoint to an untrusted network. Use a dedicated low-privilege client account
+  and only approved commands. The existing authorized-keys/password policy
+  controls SSH access; it does not authenticate or authorize MCP callers.
+- The client explicitly requires `-AcceptCommands`, strict host-key checking,
+  and non-interactive key/agent authentication for its worker connection. Its
+  original language mode is not relaxed; runtime restrictions still apply.
+  The fixed child PowerShell pump and `cmd.exe` only wire transport. Received
+  command text is never substituted into the generated batch file.
+- Timeout/disconnect is not cancellation and does not roll back side effects.
+  Do not retry uncertain commands automatically. Output limits, serial requests,
+  and client IDs are reliability features, not a command sandbox. Worker labels
+  and reported language modes are self-reported, not proof of a machine identity.
+- Client mailboxes can contain command/output data. They use the current user's
+  local app-data directory; keep its inherited ACL private, and clean up leftovers
+  after abnormal termination. Anyone able to modify those files can tamper with
+  the worker. Do not share/upload them or run this on sensitive workstations.
 - The mini-SSHD host key is persistent. Protect `SSHD_HOST_KEY` as a private key,
   verify its fingerprint on Machine A, and investigate unexpected host-key
   changes. Restrict the SSH listener with firewall rules even though SSH
