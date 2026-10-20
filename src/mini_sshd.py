@@ -137,8 +137,8 @@ class _ForwardServer(asyncssh.SSHServer):
         return (
             self._username is not None
             and self._password is not None
-            and secrets.compare_digest(username, self._username)
-            and secrets.compare_digest(password, self._password)
+            and secrets.compare_digest(username.encode('utf-8'), self._username.encode('utf-8'))
+            and secrets.compare_digest(password.encode('utf-8'), self._password.encode('utf-8'))
         )
 
     def session_requested(self):
@@ -264,7 +264,7 @@ class MiniSSHD:
             if not self.password_file.is_file():
                 raise ValueError(f"SSH password file does not exist: {self.password_file}")
             try:
-                password = self.password_file.read_text(encoding="utf-8")
+                password = self.password_file.read_text(encoding="utf-8-sig")
             except (OSError, UnicodeError) as exc:
                 raise ValueError(f"Could not read SSH password file: {exc}") from exc
             if password.endswith("\r\n"):

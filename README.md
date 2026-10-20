@@ -100,7 +100,8 @@ remote agent ──MCP──► thisMachine:8080 ──► 127.0.0.1:9333
 At least one authentication source is mandatory: an existing authorized-keys
 file or `--sshd-user` plus `--sshd-password-file`. When both are configured,
 either method is accepted. The password file is read once at startup; one final
-LF or CRLF is removed, while other spaces are preserved. It must not contain
+LF or CRLF is removed, while other spaces are preserved. An optional UTF-8 BOM
+is treated as an encoding header, not part of the password. It must not contain
 additional lines. Protect it from other users and restart EdgeMCP after rotating
 it. Password-authentication usernames are checked exactly but are not mapped to
 OS accounts. Public keys continue to accept any supplied SSH username against
@@ -180,21 +181,53 @@ With `--reversePS`, the server sends the script followed by this exact line:
 # EDGEMCP_REVERSEPS_BOOTSTRAP_END_V1
 ```
 
+The bootstrap is sent with CRLF line endings so SSH terminal display returns
+to column zero on each line instead of stair-stepping. The source's intentional
+indentation and here-string delimiters are preserved.
+
 The `-n` bootstrap connection closes its input and can then exit. Review the
 script rather than blindly executing downloaded code. The marker is a comment,
 so the saved script remains valid PowerShell. In a **separate PowerShell
-window**, run it using an already configured SSH key/agent:
+window**, run it using either an already configured SSH key/agent:
 
 ```powershell
 .\reverse-powershell.ps1 -Server server.example -Port 2222 -User worker `
   -IdentityFile "$HOME\.ssh\id_ed25519" -AcceptCommands
 ```
 
+Or use a protected password file **instead of** an identity file:
+
+```powershell
+.\reverse-powershell.ps1 -Server server.example -Port 2222 -User worker `
+  -PasswordFile "$HOME\.ssh\edgemcp-password.txt" -AcceptCommands
+```
+
+The SSH server must be configured to accept password authentication (for
+EdgeMCP, `--sshd-user` and `--sshd-password-file`). `-PasswordFile` requires
+`-User` and cannot be combined with `-IdentityFile`. Create the file outside the
+repository using a trusted editor and protect its ACL; do not put the password
+itself in command arguments or shell history. It must contain one non-empty
+UTF-8 line, at most 8192 file bytes, optionally with a BOM and one final LF/CRLF.
+UTF-16, NUL bytes, empty and multiline files are rejected. Leading/trailing
+spaces and Unicode password characters are preserved.
+
+Password mode uses Windows OpenSSH's `SSH_ASKPASS_REQUIRE=force` with a tiny
+private batch helper. It returns raw bytes from a temporary normalized file
+using `cmd`'s `type` command. The password is never interpolated into command
+arguments, environment variables, or generated code. Environment variables hold
+only helper/file paths. The helper answers at most once, password authentication
+is selected explicitly, and key/keyboard-interactive fallback is disabled. The
+temporary secret is removed after the worker welcome or on failure/cleanup;
+the original password file is never modified. Restrict the user's local app-data
+ACL because an authentication copy briefly exists there.
+
 Optional `-KnownHostsFile PATH` selects a verified known-hosts file; otherwise
-OpenSSH uses its normal known-hosts files. The worker uses `BatchMode=yes` and
-`StrictHostKeyChecking=yes`: interactive passwords and host-key approval are
-not handled in the background transport. Password authentication can be used
-for the initial bootstrap SSH, but the worker currently needs a key/agent.
+OpenSSH uses its normal known-hosts files. **Strict host-key checking remains
+on in both modes**; an unknown/changed key is an error, not an askpass approval
+prompt. Key/agent mode retains `BatchMode=yes`. No interactive prompts are
+handled by the background transport. Restart the worker to reread a rotated
+client password file.
+
 `-Label 'test workstation'` can help identify a worker. Do not use a sensitive
 machine/session or add `-AcceptCommands` unless you authorize MCP callers to
 control it. Run under the existing language/execution policy; do not bypass it.
@@ -205,8 +238,8 @@ separate, fixed PowerShell producer and Windows' built-in `cmd.exe` create a
 native OS pipe into SSH; SSH stdout goes to a private local mailbox file. The
 original PowerShell process reads commands and sends JSON results back through
 the producer. This avoids the buffering of a cyclic PS5.1 native-command
-pipeline. `cmd.exe` is used only for pipe/redirection wiring, not for executing
-received commands. No `Add-Type`, .NET stream helper, encoded command, elevation,
+pipeline. `cmd.exe` is used for pipe/redirection wiring and the optional file-backed
+askpass helper, not for executing received commands. No `Add-Type`, .NET stream helper, encoded command, elevation,
 or language-mode change is used. No SSH debug-message transport is used.
 
 ### Invoke the MCP tool

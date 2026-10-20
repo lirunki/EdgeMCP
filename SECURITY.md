@@ -34,11 +34,23 @@ EdgeMCP is a browser-automation proof of concept, not an internet-facing service
   endpoint to an untrusted network. Use a dedicated low-privilege client account
   and only approved commands. The existing authorized-keys/password policy
   controls SSH access; it does not authenticate or authorize MCP callers.
-- The client explicitly requires `-AcceptCommands`, strict host-key checking,
-  and non-interactive key/agent authentication for its worker connection. Its
-  original language mode is not relaxed; runtime restrictions still apply.
-  The fixed child PowerShell pump and `cmd.exe` only wire transport. Received
-  command text is never substituted into the generated batch file.
+- The client explicitly requires `-AcceptCommands` and strict host-key checking.
+  It supports non-interactive key/agent authentication or `-PasswordFile` with
+  an explicit `-User`. Identity/password-file modes are mutually exclusive.
+  Password mode uses native OpenSSH askpass: a fixed private batch helper reads
+  raw UTF-8 bytes from a normalized temporary file. The helper answers only once;
+  password auth is selected explicitly, with no key/keyboard-interactive fallback.
+  Unknown/changed host keys are errors, not askpass confirmations.
+- Protect the original client password file and the local app-data ACL. A
+  temporary secret copy exists only until welcome/failure/cleanup; its path,
+  not its value, is passed in the transport's environment. No password values
+  are put in arguments, generated code, or application logs. The original file
+  is never modified. UTF-8 BOM/final newline are normalized; other whitespace
+  remains significant. No interactive password change/approval is supported.
+- The original client language mode is not relaxed; runtime restrictions still
+  apply. The fixed child PowerShell pump and `cmd.exe` only handle transport and
+  optional file-backed askpass. Received command text is never substituted into
+  the generated batch file.
 - Timeout/disconnect is not cancellation and does not roll back side effects.
   Do not retry uncertain commands automatically. Output limits, serial requests,
   and client IDs are reliability features, not a command sandbox. Worker labels

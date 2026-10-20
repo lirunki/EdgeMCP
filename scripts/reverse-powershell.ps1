@@ -1,5 +1,5 @@
 # EdgeMCP ReversePS v1. Save this file and run it in a separate PowerShell window.
-# Requires Windows PowerShell 5.1+, ssh.exe, and cmd.exe (native pipe wiring only).
+# Requires Windows PowerShell 5.1, ssh.exe, and cmd.exe (pipe wiring/askpass).
 # Commands run in THIS session's existing language mode. No policy changes,
 # Add-Type, downloaded binaries, automatic elevation, or encoded commands.
 # This intentionally gives the authenticated SSH server control of this worker.
@@ -9,6 +9,7 @@ param(
     [ValidateRange(1, 65535)][int]$Port = 22,
     [string]$User,
     [string]$IdentityFile,
+    [string]$PasswordFile,
     [string]$KnownHostsFile,
     [string]$Label = 'PowerShell worker',
     [switch]$AcceptCommands,
@@ -16,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($IdentityFile -and $PasswordFile) { throw 'Use either -IdentityFile or -PasswordFile, not both.' }
 if (-not $AcceptCommands) {
     throw 'Read this script first. Add -AcceptCommands only if you authorize the SSH server/MCP callers to run commands in this session.'
 }
@@ -23,6 +25,29 @@ if ($env:OS -ne 'Windows_NT') { throw 'This client currently supports Windows Po
 $mode = '' + $ExecutionContext.SessionState.LanguageMode
 if ($mode -notin @('FullLanguage', 'ConstrainedLanguage')) { throw 'This language mode cannot run the worker.' }
 if ($Label.Length -lt 1 -or $Label.Length -gt 64) { throw 'Label must contain 1-64 characters.' }
+$passwordBytes = $null
+if ($PasswordFile) {
+    if (-not $User) { throw '-PasswordFile requires an explicit -User.' }
+    # Read bytes so the askpass helper can return UTF-8 exactly, independently
+    # of PowerShell's console encoding. Never interpolate the value into code.
+    try { $rawPassword = @(Get-Content -LiteralPath $PasswordFile -Encoding Byte -TotalCount 8193) }
+    catch { throw 'Could not read -PasswordFile. Use a protected UTF-8 file.' }
+    if ($rawPassword.Count -eq 0 -or $rawPassword.Count -gt 8192) { throw 'Password file must contain 1-8192 bytes.' }
+    $offset = 0
+    if ($rawPassword.Count -ge 3 -and $rawPassword[0] -eq 239 -and $rawPassword[1] -eq 187 -and $rawPassword[2] -eq 191) { $offset = 3 }
+    if ($rawPassword.Count -ge 2 -and (($rawPassword[0] -eq 255 -and $rawPassword[1] -eq 254) -or ($rawPassword[0] -eq 254 -and $rawPassword[1] -eq 255))) {
+        throw 'Password file must be UTF-8, not UTF-16.'
+    }
+    $end = $rawPassword.Count
+    if ($end -ge 2 -and $rawPassword[$end - 2] -eq 13 -and $rawPassword[$end - 1] -eq 10) { $end -= 2 }
+    elseif ($end -ge 1 -and $rawPassword[$end - 1] -eq 10) { $end-- }
+    if ($end -le $offset) { throw 'Password file must contain one non-empty UTF-8 line.' }
+    $passwordBytes = @($rawPassword[$offset..($end - 1)])
+    if ($passwordBytes -contains 0 -or $passwordBytes -contains 10 -or $passwordBytes -contains 13) {
+        throw 'Password file must contain one non-empty UTF-8 line without NUL bytes.'
+    }
+    $rawPassword = $null
+}
 $ssh = (Get-Command ssh.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $powerShell = Join-Path $PSHOME 'powershell.exe'
 if (-not (Test-Path -LiteralPath $powerShell)) { throw 'Windows PowerShell executable not found.' }
@@ -54,12 +79,19 @@ $stop = Join-Path $work 'stop'
 $exitFile = Join-Path $work 'exit.txt'
 $sshErrors = Join-Path $work 'ssh.err'
 $batch = Join-Path $work 'wire.cmd'
+$askpass = Join-Path $work 'askpass.cmd'
+$secretFile = Join-Path $work 'askpass.secret'
 $transport = $null
 $previousPumpDir = $env:EDGEMCP_REVERSEPS_PUMP_DIR
 
 try {
-    $sshArgs = @('-T', '-p', ('' + $Port), '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+    $sshArgs = @('-T', '-p', ('' + $Port), '-o', 'StrictHostKeyChecking=yes',
                  '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3')
+    if ($PasswordFile) {
+        $sshArgs += @('-o', 'BatchMode=no', '-o', 'PreferredAuthentications=password',
+                      '-o', 'PasswordAuthentication=yes', '-o', 'PubkeyAuthentication=no',
+                      '-o', 'KbdInteractiveAuthentication=no', '-o', 'NumberOfPasswordPrompts=1')
+    } else { $sshArgs += @('-o', 'BatchMode=yes') }
     if ($User) { $sshArgs += @('-l', $User) }
     if ($IdentityFile) { $sshArgs += @('-i', $IdentityFile, '-o', 'IdentitiesOnly=yes') }
     if ($KnownHostsFile) { $sshArgs += @('-o', ('UserKnownHostsFile=' + $KnownHostsFile)) }
@@ -93,13 +125,34 @@ while(-not (Test-Path -LiteralPath $s) -and -not (Test-Path -LiteralPath $e)) {
     $wire = '"' + $powerShell + '" -NoProfile -NonInteractive -Command "' + $pumpLine +
             '" | ("' + $ssh + '" ' + $quotedArgs + ' > "' + $incoming + '" 2> "' + $sshErrors +
             '" & echo done > "' + $exitFile + '")'
-    Set-Content -LiteralPath $batch -Encoding ASCII -Value @('@echo off', $wire)
+    $batchLines = @('@echo off')
+    if ($PasswordFile) {
+        # This copy is private, ephemeral, UTF-8 without BOM/newline. cmd TYPE
+        # returns raw bytes to OpenSSH, not the console. Only file PATHS enter
+        # environment variables; the password never enters argv/env/batch code.
+        Set-Content -LiteralPath $secretFile -Encoding Byte -Value ([byte[]]$passwordBytes)
+        $passwordBytes = $null
+        Set-Content -LiteralPath $askpass -Encoding ASCII -Value @(
+            '@echo off',
+            'if exist "%EDGEMCP_REVERSEPS_PUMP_DIR%\askpass.used" exit /b 1',
+            'echo used > "%EDGEMCP_REVERSEPS_PUMP_DIR%\askpass.used"',
+            'type "%EDGEMCP_REVERSEPS_PASSWORD_FILE%"'
+        )
+        $batchLines += @(
+            ('set "SSH_ASKPASS=' + $askpass + '"'),
+            'set "SSH_ASKPASS_REQUIRE=force"',
+            ('set "EDGEMCP_REVERSEPS_PASSWORD_FILE=' + $secretFile + '"')
+        )
+    }
+    Set-Content -LiteralPath $batch -Encoding ASCII -Value ($batchLines + $wire)
     $env:EDGEMCP_REVERSEPS_PUMP_DIR = $work
     $transport = Start-Process -FilePath $cmd -ArgumentList @('/d', '/s', '/c', ('""' + $batch + '""')) -WindowStyle Hidden -PassThru
     $env:EDGEMCP_REVERSEPS_PUMP_DIR = $previousPumpDir
 
     Write-Host ('ReversePS connecting to ' + $Server + ':' + $Port + '; language mode: ' + $mode)
-    Write-Host 'Only use a verified SSH host key. Ctrl+C stops the worker. Authentication uses an SSH key/agent.'
+    Write-Host 'Only use a verified SSH host key. Ctrl+C stops the worker.'
+    if ($PasswordFile) { Write-Host 'Authentication: protected password file (native OpenSSH askpass).' }
+    else { Write-Host 'Authentication: SSH key/agent.' }
     $marker = '# EDGEMCP_REVERSEPS_' + 'BOOTSTRAP_END_V1'
     $bootstrapDone = $false
     $lastLine = 0
@@ -135,6 +188,9 @@ while(-not (Test-Path -LiteralPath $s) -and -not (Test-Path -LiteralPath $e)) {
                     $clientId = $message.client_id
                     if ($message.version -ne 1 -or $clientId -notmatch '^[a-f0-9]{32}$') { throw 'Invalid worker welcome.' }
                     $welcome = $true
+                    if ($PasswordFile -and (Test-Path -LiteralPath $secretFile)) {
+                        Remove-Item -LiteralPath $secretFile -Force
+                    }
                     Write-Host ('Ready. MCP client_id: ' + $clientId)
                     continue
                 }
@@ -200,7 +256,14 @@ while(-not (Test-Path -LiteralPath $s) -and -not (Test-Path -LiteralPath $e)) {
         Start-Sleep -Milliseconds 100
     }
 } finally {
+    $passwordBytes = $null
+    $rawPassword = $null
     $env:EDGEMCP_REVERSEPS_PUMP_DIR = $previousPumpDir
+    # Remove any pending authentication copy even if transport shutdown stalls.
+    if (Test-Path -LiteralPath $secretFile) {
+        try { Remove-Item -LiteralPath $secretFile -Force }
+        catch { Write-Warning ('Could not remove the temporary password copy in ' + $work) }
+    }
     # Signal the fixed producer to close stdin. Server EOF handling closes SSH.
     if ($transport) {
         Set-Content -LiteralPath $stop -Encoding ASCII -Value 'stop'

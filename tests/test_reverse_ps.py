@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -78,8 +79,11 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         process = await connection.create_process()
         process.stdin.write_eof()
         code = await asyncio.wait_for(process.stdout.read(), 5)
-        self.assertTrue(code.endswith(reverse_ps.MARKER + '\n'))
-        self.assertEqual(code.count('\n' + reverse_ps.MARKER + '\n'), 1)
+        self.assertTrue(code.endswith(reverse_ps.MARKER + '\r\n'))
+        self.assertEqual(code.count('\r\n' + reverse_ps.MARKER + '\r\n'), 1)
+        self.assertNotIn('\n', code.replace('\r\n', ''))
+        expected = (ROOT / 'scripts/reverse-powershell.ps1').read_text().rstrip() + '\n' + reverse_ps.MARKER + '\n'
+        self.assertEqual(code.replace('\r\n', '\n'), expected)
         self.assertEqual(self.broker.run()['clients'], [])
 
     async def test_two_workers_cannot_complete_each_others_request(self):
@@ -228,6 +232,93 @@ class CLITests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == 'win32' and shutil.which('ssh.exe') and shutil.which('powershell.exe'),
                      'Real client test requires Windows PowerShell/OpenSSH')
 class WindowsClientTests(ProtocolTests):
+    async def test_real_password_file_worker_and_failures(self):
+        password = ' file-' + secrets.token_urlsafe(10) + ' &|%!^<>\u00e9 '
+        configured = self.root / 'configured-password'
+        configured.write_bytes(b'\xef\xbb\xbf' + password.encode('utf-8') + b'\r\n')
+        password_sshd = mini_sshd.MiniSSHD('127.0.0.1', free_port(), free_port(),
+            authorized_keys=None, host_key=self.root / 'password-host', username='worker',
+            password_file=configured, reverse_broker=self.broker)
+        password_sshd.start()
+        self.addCleanup(password_sshd.stop)
+        known = self.root / 'password-known'
+        host = asyncssh.read_private_key(self.root / 'password-host')
+        known.write_bytes(f'[127.0.0.1]:{password_sshd.port} '.encode() + host.export_public_key())
+        supplied = self.root / 'client-password'
+        wrong = self.root / 'wrong-password'
+        wrong.write_text('wrong test password\n', encoding='utf-8')
+        # BOM and one CRLF are normalized; whitespace and shell characters stay DATA.
+        supplied.write_bytes(b'\xef\xbb\xbf' + password.encode('utf-8') + b'\r\n')
+        original = supplied.read_bytes()
+        plain = self.root / 'plain-password'
+        plain.write_text(password + '\n', encoding='utf-8')
+        malformed = {}
+        for label, data in (('empty', b''), ('multiline', b'one\ntwo\n'),
+                            ('double-newline', b'one\n\n'), ('nul', b'one\x00two'),
+                            ('utf16', 'text'.encode('utf-16')), ('oversized', b'x' * 8193)):
+            path = self.root / ('invalid-' + label)
+            path.write_bytes(data)
+            malformed[label] = path
+        unknown_hosts = self.root / 'unknown-hosts'
+        unknown_hosts.write_bytes(b'')
+        script = (ROOT / 'scripts/reverse-powershell.ps1').read_text()
+        quote = lambda s: "'" + str(s).replace("'", "''") + "'"
+        cases = [
+            ('valid', supplied, '', True),
+            ('valid-no-bom', plain, '', True),
+            ('wrong', wrong, '', False),
+            ('missing', self.root / 'absent-file', '', False),
+            ('conflicting-modes', supplied, '-IdentityFile unused', False),
+            ('unknown-host', supplied, '', False),
+        ] + [(label, path, '', False) for label, path in malformed.items()]
+        for label, password_path, extra, succeeds in cases:
+            with self.subTest(case=label):
+                command = "$ExecutionContext.SessionState.LanguageMode='ConstrainedLanguage'; & {\n" + script + '\n} '
+                known_path = unknown_hosts if label == 'unknown-host' else known
+                command += f'-Server 127.0.0.1 -Port {password_sshd.port} -User worker -PasswordFile {quote(password_path)} -KnownHostsFile {quote(known_path)} -AcceptCommands -MaxSessionSeconds 5 {extra}'
+                process = await asyncio.create_subprocess_exec('powershell.exe', '-NoProfile', '-NonInteractive',
+                    '-Command', command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                try:
+                    cid = None
+                    if succeeds:
+                        for _ in range(160):
+                            workers = self.broker.run()['clients']
+                            if workers:
+                                cid = workers[0]['client_id']
+                                break
+                            if process.returncode is not None:
+                                break
+                            await asyncio.sleep(.05)
+                        if cid:
+                            result = await asyncio.to_thread(self.broker.run,
+                                "Write-Output 'password-file-ok'; $ExecutionContext.SessionState.LanguageMode", cid, 4000)
+                            self.assertEqual(result['status'], 'completed')
+                            self.assertTrue(result['success'])
+                            self.assertIn('password-file-ok', result['output'])
+                            self.assertIn('ConstrainedLanguage', result['output'])
+                            workroot = Path(os.environ['LOCALAPPDATA']) / 'EdgeMCP/reverseps'
+                            dirs = list(workroot.glob(f'worker-{process.pid}-*'))
+                            self.assertEqual(len(dirs), 1)
+                            self.assertFalse((dirs[0] / 'askpass.secret').exists(), 'Authentication copy must be removed after welcome')
+                            for name in ('wire.cmd', 'askpass.cmd', 'ssh.err', 'incoming.txt'):
+                                self.assertNotIn(password.encode('utf-8'), (dirs[0] / name).read_bytes(), 'Credential must not be in code or logs')
+                            client = self.broker.clients[cid]
+                            client.loop.call_soon_threadsafe(client.session.close)
+                    out, err = await asyncio.wait_for(process.communicate(), 15)
+                    self.assertNotIn(password.encode('utf-8'), out + err, 'Credential leaked to diagnostics')
+                    if succeeds:
+                        self.assertIsNotNone(cid, 'Password worker did not register: ' + (out + err).decode(errors='replace').replace(password, '[REDACTED]'))
+                        self.assertEqual(process.returncode, 0, 'Password worker failed; no credential-bearing logs displayed')
+                    else:
+                        self.assertNotEqual(process.returncode, 0)
+                    workroot = Path(os.environ['LOCALAPPDATA']) / 'EdgeMCP/reverseps'
+                    self.assertEqual(list(workroot.glob(f'worker-{process.pid}-*')), [], 'Worker files must be cleaned')
+                    self.assertEqual(supplied.read_bytes(), original, 'Original password file must not change')
+                finally:
+                    if process.returncode is None:
+                        process.terminate()
+                        await process.wait()
+
     async def test_real_ps51_constrained_worker(self):
         import win32api
         import win32security

@@ -2,6 +2,8 @@
 p.txt
 pat.txt
 pwd.txt
+*password*.txt
+*.secret
 .env
 .env.*
 *.pem

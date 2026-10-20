@@ -46,7 +46,11 @@ class Broker:
         script = script_path.read_text(encoding='utf-8')
         if MARKER in script.splitlines():
             raise ValueError('Bootstrap script contains the reserved marker line')
-        self.bootstrap = script.rstrip() + '\n' + MARKER + '\n'
+        # Interactive SSH terminals may treat bare LF as down-without-return,
+        # producing stair-step indentation. Preserve source indent, normalize
+        # each displayed/downloaded line to CRLF (also accepted by the worker).
+        script = script.replace('\r\n', '\n').replace('\r', '\n')
+        self.bootstrap = (script.rstrip() + '\n' + MARKER + '\n').replace('\n', '\r\n')
         self.clients: dict[str, Client] = {}
         self.lock = threading.Lock()
 
