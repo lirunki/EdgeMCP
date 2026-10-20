@@ -24,19 +24,56 @@ def free_port() -> int:
 
 
 class PolicyTests(unittest.TestCase):
-    def test_only_configured_loopback_forward_is_allowed(self):
-        policy = mini_sshd._ForwardServer(9333)
+    def test_only_configured_loopback_forwards_are_allowed(self):
+        policy = mini_sshd._ForwardServer((9333, 9444))
         for host in ("", "localhost", "127.0.0.1", "::1", "[::1]"):
-            with self.subTest(host=host):
-                self.assertTrue(policy.server_requested(host, 9333))
-        for host, port in (("0.0.0.0", 9333), ("example.test", 9333), ("127.0.0.1", 9334), ("", 0)):
+            for port in (9333, 9444):
+                with self.subTest(host=host, port=port):
+                    self.assertTrue(policy.server_requested(host, port))
+        for host, port in (("0.0.0.0", 9333), ("example.test", 9444), ("127.0.0.1", 9334), ("", 0)):
             with self.subTest(host=host, port=port):
                 self.assertFalse(policy.server_requested(host, port))
+
+    def test_only_configured_loopback_direct_destinations_are_allowed(self):
+        policy = mini_sshd._ForwardServer(9333, backward_ports=(8080, 8443))
+        for host in ("localhost", "127.0.0.1", "::1", "[::1]"):
+            for port in (8080, 8443):
+                with self.subTest(host=host, port=port):
+                    self.assertTrue(
+                        policy.connection_requested(host, port, "127.0.0.1", 50000)
+                    )
+        for host, port in (
+            ("", 8080), ("0.0.0.0", 8080), ("example.test", 8080),
+            ("127.0.0.1", 8081),
+        ):
+            with self.subTest(host=host, port=port):
+                self.assertFalse(
+                    policy.connection_requested(host, port, "127.0.0.1", 50000)
+                )
 
     def test_ports_are_validated(self):
         for value in (0, 65536, -1, "bad", True):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 mini_sshd.MiniSSHD("127.0.0.1", value, 9333, authorized_keys="keys", host_key="host")
+            with self.subTest(forward_port=value), self.assertRaises(ValueError):
+                mini_sshd.MiniSSHD(
+                    "127.0.0.1", 2222, 9333, authorized_keys="keys",
+                    host_key="host", forward_ports=[value],
+                )
+            with self.subTest(backward_port=value), self.assertRaises(ValueError):
+                mini_sshd.MiniSSHD(
+                    "127.0.0.1", 2222, 9333, authorized_keys="keys",
+                    host_key="host", backward_ports=[value],
+                )
+
+    def test_forward_ports_are_ordered_and_deduplicated(self):
+        sshd = mini_sshd.MiniSSHD(
+            "127.0.0.1", 2222, 9333, authorized_keys="keys",
+            host_key="host", forward_ports=[9444, "9333", "9555", 9444],
+            backward_ports=[8080, "8443", 8080],
+        )
+        self.assertEqual(sshd.forward_ports, (9333, 9444, 9555))
+        self.assertEqual(sshd.backward_ports, (8080, 8443))
 
     def test_host_key_is_created_once_with_private_permissions(self):
         with tempfile.TemporaryDirectory() as root:
@@ -104,17 +141,20 @@ class ForwardIntegrationTests(unittest.IsolatedAsyncioTestCase):
             banner = await asyncio.to_thread(read_banner)
             self.assertTrue(banner.startswith(b"SSH-2.0-"), banner)
 
-    async def test_authenticated_remote_forward_carries_bytes(self):
+    async def test_authenticated_multiple_remote_forwards_carry_bytes(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             client_key = asyncssh.generate_private_key("ssh-ed25519")
             authorized = root / "authorized_keys"
             authorized.write_bytes(client_key.export_public_key("openssh"))
-            ssh_port, remote_port = free_port(), free_port()
+            ssh_port, remote_port, second_remote_port = (
+                free_port(), free_port(), free_port()
+            )
             sshd = mini_sshd.MiniSSHD(
                 "127.0.0.1", ssh_port, remote_port,
                 authorized_keys=authorized,
                 host_key=root / "host_key",
+                forward_ports=[second_remote_port],
             )
             sshd.start()
             self.addCleanup(sshd.stop)
@@ -134,14 +174,63 @@ class ForwardIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "127.0.0.1", ssh_port, username="forwarder",
                 client_keys=[client_key], known_hosts=None,
             ) as connection:
-                listener = await connection.forward_remote_port(
-                    "127.0.0.1", remote_port, "127.0.0.1", echo_port
-                )
-                self.assertIsNotNone(listener)
-                reader, writer = await asyncio.open_connection("127.0.0.1", remote_port)
-                writer.write(b"CDP tunnel")
+                listeners = [
+                    await connection.forward_remote_port(
+                        "127.0.0.1", port, "127.0.0.1", echo_port
+                    )
+                    for port in (remote_port, second_remote_port)
+                ]
+                for index, port in enumerate((remote_port, second_remote_port), 1):
+                    with self.subTest(port=port):
+                        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                        payload = f"tunnel {index}".encode()
+                        writer.write(payload)
+                        await writer.drain()
+                        self.assertEqual(await reader.readexactly(len(payload)), payload)
+                        writer.close()
+                        await writer.wait_closed()
+                for listener in listeners:
+                    listener.close()
+                    await listener.wait_closed()
+
+    async def test_authenticated_direct_forward_carries_bytes(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            client_key = asyncssh.generate_private_key("ssh-ed25519")
+            authorized = root / "authorized_keys"
+            authorized.write_bytes(client_key.export_public_key("openssh"))
+
+            async def echo(reader, writer):
+                writer.write(await reader.read(100))
                 await writer.drain()
-                self.assertEqual(await reader.readexactly(10), b"CDP tunnel")
+                writer.close()
+                await writer.wait_closed()
+
+            echo_server = await asyncio.start_server(echo, "127.0.0.1", 0)
+            self.addAsyncCleanup(echo_server.wait_closed)
+            self.addCleanup(echo_server.close)
+            echo_port = echo_server.sockets[0].getsockname()[1]
+            sshd = mini_sshd.MiniSSHD(
+                "127.0.0.1", free_port(), free_port(),
+                authorized_keys=authorized, host_key=root / "host_key",
+                backward_ports=[echo_port],
+            )
+            sshd.start()
+            self.addCleanup(sshd.stop)
+
+            async with asyncssh.connect(
+                "127.0.0.1", sshd.port, username="forwarder",
+                client_keys=[client_key], known_hosts=None,
+            ) as connection:
+                listener = await connection.forward_local_port(
+                    "127.0.0.1", 0, "127.0.0.1", echo_port
+                )
+                reader, writer = await asyncio.open_connection(
+                    "127.0.0.1", listener.get_port()
+                )
+                writer.write(b"backward tunnel")
+                await writer.drain()
+                self.assertEqual(await reader.readexactly(15), b"backward tunnel")
                 writer.close()
                 await writer.wait_closed()
                 listener.close()
@@ -226,6 +315,8 @@ class CLITests(unittest.TestCase):
     def test_cli_starts_and_stops_sshd_around_mcp(self):
         argv = [
             "server.py", "--sshd", "127.0.0.1:2222", "--cdp", "127.0.0.1:9333",
+            "--sshd-forward-port", "9444", "--sshd-forward-port", "9555",
+            "--ssh-backward-port", "8080", "--ssh-backward-port", "8443",
             "--sshd-authorized-keys", "allowed", "--sshd-host-key", "host",
             "--sshd-user", "forwarder", "--sshd-password-file", "password.txt",
         ]
@@ -234,6 +325,7 @@ class CLITests(unittest.TestCase):
         self.sshd_class.assert_called_once_with(
             "127.0.0.1", "2222", "9333", authorized_keys="allowed", host_key="host",
             username="forwarder", password_file="password.txt",
+            forward_ports=["9444", "9555"], backward_ports=["8080", "8443"],
         )
         self.sshd.start.assert_called_once_with()
         self.run.assert_called_once()

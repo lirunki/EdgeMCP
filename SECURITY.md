@@ -15,10 +15,15 @@ EdgeMCP is a browser-automation proof of concept, not an internet-facing service
 - CDP is another privileged endpoint. Keep the browser debugging port private.
 - Optional `--sshd` requires either a key from `--sshd-authorized-keys` or the
   exact `--sshd-user` and password read from `--sshd-password-file`. It accepts
-  only a loopback remote listener on the exact configured CDP port. It has no command
-  interpreter: remote exec/subsystems, direct TCP forwarding, agent forwarding,
-  and X11 forwarding are rejected. A plain SSH shell request is an inert channel
-  which exists only to keep `ssh -R` connected; prefer `ssh -N`.
+  only loopback remote listeners on the configured CDP port and ports explicitly
+  added with repeatable `--sshd-forward-port` options. Direct (`-L`) forwarding
+  is disabled unless destination ports are explicitly added with repeatable
+  `--ssh-backward-port` options, and those destinations are restricted to the
+  server's loopback. Each additional port expands what authenticated clients
+  can expose or reach, so allow only ports the service needs. It has no command
+  interpreter: remote exec/subsystems, agent forwarding, X11 forwarding, and
+  unconfigured TCP forwarding are rejected. A plain SSH shell request is an
+  inert channel which exists only to keep forwarding connected; prefer `ssh -N`.
 - The mini-SSHD host key is persistent. Protect `SSHD_HOST_KEY` as a private key,
   verify its fingerprint on Machine A, and investigate unexpected host-key
   changes. Restrict the SSH listener with firewall rules even though SSH

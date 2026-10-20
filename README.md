@@ -54,13 +54,19 @@ remote agent ──MCP──► thisMachine:8080 ──► 127.0.0.1:9333
    printf '%s\n' 'replace-with-a-strong-password' > ~/.edgemcp/forwarding-password
    ```
 
-   Then start EdgeMCP on thisMachine. Here `9333` is the tunnel listener and
-   `2222` is mini-SSHD. For password authentication, add the final two flags:
+   Then start EdgeMCP on thisMachine. Here `9333` is the CDP tunnel listener,
+   `9444` is an optional second tunnel listener, and `2222` is mini-SSHD. Add
+   `--sshd-forward-port` once per additional remote (`-R`) listener; the `--cdp`
+   port is always allowed. `--ssh-backward-port 8080` optionally allows direct
+   (`-L`) forwarding to thisMachine's loopback port 8080. For password
+   authentication, add the final two flags:
 
    ```bash
    python src/server.py \
      --sshd 2222 \
      --cdp 127.0.0.1:9333 \
+     --sshd-forward-port 9444 \
+     --ssh-backward-port 8080 \
      --listen 0.0.0.0:8080 \
      --sshd-user forwarder \
      --sshd-password-file ~/.edgemcp/forwarding-password
@@ -73,14 +79,21 @@ remote agent ──MCP──► thisMachine:8080 ──► 127.0.0.1:9333
    ssh -N -p 2222 \
      -o ExitOnForwardFailure=yes \
      -R 127.0.0.1:9333:127.0.0.1:9222 \
+     -R 127.0.0.1:9444:127.0.0.1:9444 \
+     -L 127.0.0.1:18080:127.0.0.1:8080 \
      user@thisMachine
    ```
 
    `-N` is recommended because no remote shell is needed. A command without
    `-N` is also kept connected by an inert forwarding-only session, but there
-   is no command interpreter. Remote exec, subsystems, direct forwarding,
-   agent forwarding, and X11 forwarding are rejected. Only a loopback remote
-   listener on the exact configured CDP port (`9333` here) is accepted.
+   is no command interpreter. Remote exec, subsystems, agent forwarding, X11
+   forwarding, and unconfigured direct forwarding are rejected. Only loopback
+   remote listeners on the configured CDP port and explicit
+   `--sshd-forward-port` values (`9333` and `9444` here) are accepted. Direct
+   forwarding can reach only loopback destination ports explicitly listed with
+   `--ssh-backward-port` (`8080` here); the `-L` local listener port (`18080`)
+   is chosen by the SSH client and need not match. Multiple `-R` and `-L`
+   options can use one SSH connection.
 
 3. Point agents at `http://thisMachine:8080/mcp`.
 
@@ -334,6 +347,8 @@ Flags:
 - `--path PATH` — endpoint path (default `/mcp`).
 - `--launch-edge` — launch local Edge on the configured CDP port before serving MCP (off by default).
 - `--sshd [HOST:]PORT` — run the forwarding-only SSH server; a bare port binds using `SSHD_HOST` (default `0.0.0.0`).
+- `--sshd-forward-port PORT` — allow an additional loopback remote-forward (`-R`) port; repeat for multiple ports (the `--cdp` port is always allowed).
+- `--ssh-backward-port PORT` — allow direct (`-L`) forwarding to this loopback destination port; repeat for multiple ports (disabled by default).
 - `--sshd-authorized-keys PATH` — allowed client public keys (default `SSHD_AUTHORIZED_KEYS` or `~/.ssh/authorized_keys`).
 - `--sshd-host-key PATH` — unencrypted server private key, generated as Ed25519 if missing (default `SSHD_HOST_KEY` or `~/.edgemcp/ssh_host_ed25519_key`).
 - `--sshd-user USER` — exact username accepted for password authentication (default `SSHD_USER`).
@@ -388,6 +403,8 @@ must perform the MCP initialization handshake.
 | `--path` | `MCP_PATH` | `/mcp` | Streamable-HTTP endpoint path. |
 | `--launch-edge` | — | off | Launch local Edge on `--cdp` before starting MCP. |
 | `--sshd [HOST:]PORT` | `SSHD_HOST` (host only) | off (`0.0.0.0` host) | Start forwarding-only mini-SSHD. |
+| `--sshd-forward-port PORT` | — | none | Allow an additional loopback remote-forward (`-R`) port; repeatable. |
+| `--ssh-backward-port PORT` | — | none | Allow direct (`-L`) forwarding to a loopback destination port; repeatable. |
 | `--sshd-authorized-keys PATH` | `SSHD_AUTHORIZED_KEYS` | `~/.ssh/authorized_keys` | Authorized client public keys. |
 | `--sshd-host-key PATH` | `SSHD_HOST_KEY` | `~/.edgemcp/ssh_host_ed25519_key` | Persistent server host key. |
 | `--sshd-user USER` | `SSHD_USER` | unset | Username for password authentication. |

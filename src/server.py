@@ -15,7 +15,9 @@ Flags (env fallbacks shown):
   --listen HOST:PORT  MCP HTTP bind address             (MCP_HOST/MCP_PORT, 127.0.0.1:8080)
   --path PATH         MCP Streamable-HTTP endpoint path (MCP_PATH, /mcp)
   --launch-edge       launch local Edge on the configured CDP port before serving
-  --sshd [HOST:]PORT  accept an SSH remote forward for the configured loopback CDP port
+  --sshd [HOST:]PORT  accept SSH remote forwards on explicitly allowed loopback ports
+  --sshd-forward-port PORT  allow an additional remote-forward port (repeatable)
+  --ssh-backward-port PORT  allow direct forwarding to a loopback port (repeatable)
   --sshd-user USER     username for optional password authentication
   --sshd-password-file PATH  read the SSH password from a protected one-line file
 
@@ -760,6 +762,20 @@ def main() -> None:
         help="Start an in-process SSH server for a remote CDP forward (default bind host: SSHD_HOST or 0.0.0.0)",
     )
     parser.add_argument(
+        "--sshd-forward-port",
+        action="append",
+        default=[],
+        metavar="PORT",
+        help="Allow an additional loopback remote-forward port (repeatable; the --cdp port is always allowed)",
+    )
+    parser.add_argument(
+        "--ssh-backward-port",
+        action="append",
+        default=[],
+        metavar="PORT",
+        help="Allow direct (-L) forwarding to an additional loopback destination port (repeatable)",
+    )
+    parser.add_argument(
         "--sshd-authorized-keys",
         default=SSHD_AUTHORIZED_KEYS,
         metavar="PATH",
@@ -817,13 +833,26 @@ def main() -> None:
                 host_key=args.sshd_host_key,
                 username=args.sshd_user,
                 password_file=args.sshd_password_file,
+                forward_ports=args.sshd_forward_port,
+                backward_ports=args.ssh_backward_port,
             )
             ssh_server.start()
         except (ValueError, RuntimeError) as exc:
             parser.error(str(exc))
+        allowed_ports = ", ".join(
+            f"{CDP_HOST}:{port}"
+            for port in dict.fromkeys((CDP_PORT, *args.sshd_forward_port))
+        )
+        backward_ports = ", ".join(
+            f"127.0.0.1:{port}" for port in dict.fromkeys(args.ssh_backward_port)
+        )
+        backward_status = (
+            f"; direct forwarding only to {backward_ports}"
+            if backward_ports else "; direct forwarding disabled"
+        )
         print(
             f"[edgemcp] SSHD listening on {sshd_host}:{sshd_port}; allowing authenticated "
-            f"remote forwarding only on {CDP_HOST}:{CDP_PORT}.",
+            f"remote forwarding only on {allowed_ports}{backward_status}.",
             flush=True,
         )
 

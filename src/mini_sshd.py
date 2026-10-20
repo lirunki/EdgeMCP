@@ -1,9 +1,8 @@
-"""Small in-process SSH server for a single constrained remote CDP forward.
+"""Small in-process SSH server for constrained remote TCP forwards.
 
-The server supports public-key and optional file-backed password authentication,
-but only remote TCP forwarding. A requested remote listener must be loopback-only and use the exact
-port configured for EdgeMCP's CDP client, preventing use as a general-purpose
-SSH proxy.
+The server supports public-key and optional file-backed password authentication.
+Remote TCP listeners and direct TCP destinations must be loopback-only and use
+explicitly allowed ports, preventing use as a general-purpose SSH proxy.
 """
 from __future__ import annotations
 
@@ -12,6 +11,7 @@ import os
 import secrets
 import stat
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,16 @@ def _port(value: str | int, label: str) -> int:
     result = int(value)
     if not 1 <= result <= 65535:
         raise ValueError(f"{label} must be an integer from 1 to 65535")
+    return result
+
+
+def _ports(values: str | int | Iterable[str | int], label: str) -> tuple[int, ...]:
+    """Validate ports, preserving order while removing duplicates."""
+    if isinstance(values, (str, int)):
+        values = (values,)
+    result = tuple(dict.fromkeys(_port(value, label) for value in values))
+    if not result:
+        raise ValueError(f"{label} must contain at least one port")
     return result
 
 
@@ -85,12 +95,16 @@ class _ForwardSession(asyncssh.SSHServerSession):
 class _ForwardServer(asyncssh.SSHServer):
     def __init__(
         self,
-        allowed_port: int,
+        allowed_ports: str | int | Iterable[str | int],
         connections: set[Any] | None = None,
         username: str | None = None,
         password: str | None = None,
+        backward_ports: Iterable[str | int] = (),
     ):
-        self._allowed_port = allowed_port
+        self._allowed_ports = frozenset(_ports(allowed_ports, "Allowed forward port"))
+        self._backward_ports = frozenset(
+            _port(port, "SSH backward port") for port in backward_ports
+        )
         self._connections = connections
         self._username = username
         self._password = password
@@ -125,9 +139,16 @@ class _ForwardServer(asyncssh.SSHServer):
         return _ForwardSession()
 
     def server_requested(self, listen_host: str, listen_port: int) -> bool:
-        """Authorize only `-R allowed_port:...` bound on this server's loopback."""
+        """Authorize only an allowed `-R` listener bound on this server's loopback."""
         host = (listen_host or "").lower().strip("[]")
-        return host in _LOOPBACK_HOSTS and listen_port == self._allowed_port
+        return host in _LOOPBACK_HOSTS and listen_port in self._allowed_ports
+
+    def connection_requested(
+        self, dest_host: str, dest_port: int, orig_host: str, orig_port: int
+    ) -> bool:
+        """Authorize `-L` only to an allowed loopback destination port."""
+        host = (dest_host or "").lower().strip("[]")
+        return bool(host) and host in _LOOPBACK_HOSTS and dest_port in self._backward_ports
 
 
 class MiniSSHD:
@@ -143,10 +164,18 @@ class MiniSSHD:
         host_key: str | os.PathLike[str],
         username: str | None = None,
         password_file: str | os.PathLike[str] | None = None,
+        forward_ports: Iterable[str | int] = (),
+        backward_ports: Iterable[str | int] = (),
     ):
         self.host = host
         self.port = _port(port, "SSHD port")
         self.cdp_port = _port(cdp_port, "CDP forward port")
+        self.forward_ports = _ports(
+            (self.cdp_port, *forward_ports), "SSHD forward port"
+        )
+        self.backward_ports = tuple(dict.fromkeys(
+            _port(value, "SSH backward port") for value in backward_ports
+        ))
         self.authorized_keys = Path(authorized_keys).expanduser() if authorized_keys else None
         self.host_key = Path(host_key).expanduser()
         self.username = username
@@ -170,7 +199,11 @@ class MiniSSHD:
             self.host,
             self.port,
             server_factory=lambda: _ForwardServer(
-                self.cdp_port, self._connections, self.username, self._password
+                self.forward_ports,
+                self._connections,
+                self.username,
+                self._password,
+                self.backward_ports,
             ),
             server_host_keys=[str(self.host_key)],
             authorized_client_keys=(
